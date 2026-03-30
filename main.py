@@ -8,7 +8,7 @@ from cachetools import TTLCache
 app = FastAPI(
     title="Quant API",
     description="High-performance, financial API for Quant Traders & AI Agents.",
-    version="1.3.0"
+    version="1.4.0"
 )
 
 # ---------------------------------------------------------
@@ -17,6 +17,9 @@ app = FastAPI(
 CACHE_TTL = 300        # Cache lifespan = 5 minutes
 CACHE_MAX  = 500       # Maximum concurrent tickers
 MEMORY_CACHE: TTLCache = TTLCache(maxsize=CACHE_MAX, ttl=CACHE_TTL)
+
+# FIX #4: Whitelist valid data_range values
+VALID_RANGES = {"1y", "2y", "5y", "10y", "max"}
 
 # ---------------------------------------------------------
 # Core: Fetch Data & Calculate Indicators (Async + Pure Polars)
@@ -41,7 +44,7 @@ async def fetch_and_calculate(ticker: str, data_range: str = "10y") -> pl.DataFr
 
     # Create DataFrame directly from JSON
     df = pl.DataFrame({
-        "Date":   [datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d") 
+        "Date":   [datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
                    for ts in result["timestamp"]],
         "Open":   quotes.get("open",   []),
         "High":   quotes.get("high",   []),
@@ -89,30 +92,32 @@ async def fetch_and_calculate(ticker: str, data_range: str = "10y") -> pl.DataFr
           .otherwise(0).alias("OBV_Step"),
     ])
 
-    # --- Block 4: Signal, Avg Gain/Loss, ATR, OBV ---
+    # --- Block 4: Signal, Avg Gain/Loss (Wilder's EWM), ATR, OBV ---
+    # FIX #2: Use Wilder's Smoothing (alpha=1/14) instead of rolling_mean for RSI
     df = df.with_columns([
         pl.col("MACD_Line").ewm_mean(span=9, adjust=False).alias("MACD_Signal"),
-        pl.col("gain").rolling_mean(window_size=14).alias("avg_gain"),
-        pl.col("loss").rolling_mean(window_size=14).alias("avg_loss"),
+        pl.col("gain").ewm_mean(alpha=1/14, adjust=False).alias("avg_gain"),   # ✅ Fixed
+        pl.col("loss").ewm_mean(alpha=1/14, adjust=False).alias("avg_loss"),   # ✅ Fixed
         pl.col("True_Range").ewm_mean(alpha=1/14, adjust=False).alias("ATR_14"),
         pl.col("OBV_Step").cum_sum().alias("OBV"),
     ])
 
     # --- Block 5: MACD Hist + RSI (div-by-zero safe) ---
-    # Use when/then to safely handle division by zero in avg_loss
     safe_avg_loss = pl.when(pl.col("avg_loss") == 0).then(1e-10).otherwise(pl.col("avg_loss"))
-    
+
     df = df.with_columns([
         (pl.col("MACD_Line") - pl.col("MACD_Signal")).alias("MACD_Hist"),
         (100 - (100 / (1 + (pl.col("avg_gain") / safe_avg_loss)))).alias("RSI_14"),
     ])
 
+    # FIX #1: Drop nulls AFTER all indicators are calculated
     return df.select([
         "Date", "Close", "Volume",
         "SMA_20", "EMA_50", "RSI_14",
         "MACD_Line", "MACD_Signal", "MACD_Hist",
         "BB_Upper", "BB_Lower", "ATR_14", "OBV",
-    ])
+    ]).drop_nulls()  # ✅ Fixed
+
 
 # ---------------------------------------------------------
 # Endpoint: GET /api/v1/indicators/{ticker}
@@ -128,12 +133,19 @@ async def get_quant_data(
     # --- Validate ticker format ---
     if not re.match(r"^[A-Z0-9.\-]{1,10}$", ticker):
         raise HTTPException(
-            status_code=400, 
+            status_code=400,
             detail="Invalid ticker format. Only uppercase letters, numbers, dots, and hyphens are allowed (max 10 characters)."
         )
 
-    # --- Cache lookup (Combine ticker and data_range for unique key) ---
-    cache_key = f"{ticker}_{data_range}"
+    # FIX #4: Validate data_range against whitelist
+    if data_range not in VALID_RANGES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid data_range '{data_range}'. Must be one of: {sorted(VALID_RANGES)}"
+        )
+
+    # FIX #3: Use '::' separator to avoid cache key collision
+    cache_key = f"{ticker}::{data_range}"
     served_from_cache = cache_key in MEMORY_CACHE
 
     if served_from_cache:
