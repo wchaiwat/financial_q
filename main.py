@@ -1,39 +1,119 @@
-from fastapi import FastAPI, Query, HTTPException
-import polars as pl
-import httpx
+from contextlib import asynccontextmanager
+from typing import Any
+import logging
+import os
 import re
 from datetime import datetime, timezone
-from cachetools import TTLCache
 
-app = FastAPI(
-    title="Quant API",
-    description="High-performance, financial API for Quant Traders & AI Agents.",
-    version="1.4.0"
+import httpx
+import polars as pl
+from cachetools import TTLCache
+from fastapi import FastAPI, Query, HTTPException, Request
+from pydantic import BaseModel
+
+# ---------------------------------------------------------
+# Logging (replaces print statements)
+# ---------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
 )
+logger = logging.getLogger("quant_api")
+
+# ---------------------------------------------------------
+# Config (env-variable driven for ops tuning)
+# ---------------------------------------------------------
+CACHE_TTL  = int(os.getenv("CACHE_TTL", 300))   # seconds
+CACHE_MAX  = int(os.getenv("CACHE_MAX",  500))   # max tickers
+TIMEOUT    = float(os.getenv("HTTP_TIMEOUT", 10))
+
+VALID_RANGES = {"1y", "2y", "5y", "10y", "max"}
+
+YAHOO_HOSTS = [
+    "query1.finance.yahoo.com",
+    "query2.finance.yahoo.com",  # fallback when query1 rate-limits
+]
 
 # ---------------------------------------------------------
 # In-Memory Cache (LRU + TTL)
 # ---------------------------------------------------------
-CACHE_TTL = 300        # Cache lifespan = 5 minutes
-CACHE_MAX  = 500       # Maximum concurrent tickers
 MEMORY_CACHE: TTLCache = TTLCache(maxsize=CACHE_MAX, ttl=CACHE_TTL)
 
-# FIX #4: Whitelist valid data_range values
-VALID_RANGES = {"1y", "2y", "5y", "10y", "max"}
+# ---------------------------------------------------------
+# Lifespan: shared httpx client (connection pooling)
+# ---------------------------------------------------------
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.http = httpx.AsyncClient(
+        timeout=TIMEOUT,
+        headers={"User-Agent": "Mozilla/5.0"},
+    )
+    logger.info("HTTP client initialised (timeout=%.1fs)", TIMEOUT)
+    yield
+    await app.state.http.aclose()
+    logger.info("HTTP client closed")
+
+
+# ---------------------------------------------------------
+# FastAPI app
+# ---------------------------------------------------------
+app = FastAPI(
+    title="Quant API",
+    description="High-performance financial API for Quant Traders & AI Agents.",
+    version="1.5.0",
+    lifespan=lifespan,
+)
+
+
+# ---------------------------------------------------------
+# Pydantic response models
+# ---------------------------------------------------------
+class Metadata(BaseModel):
+    ticker:            str
+    target_days:       int
+    data_range_used:   str
+    rows_returned:     int
+    rows_available:    int
+    truncated:         bool
+    served_from_cache: bool
+    timestamp:         str
+
+
+class QuantResponse(BaseModel):
+    metadata: Metadata
+    data:     dict[str, list[Any]]
+
 
 # ---------------------------------------------------------
 # Core: Fetch Data & Calculate Indicators (Async + Pure Polars)
 # ---------------------------------------------------------
-async def fetch_and_calculate(ticker: str, data_range: str = "10y") -> pl.DataFrame:
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
+async def fetch_and_calculate(
+    client: httpx.AsyncClient,
+    ticker: str,
+    data_range: str = "10y",
+) -> pl.DataFrame:
     params = {"interval": "1d", "range": data_range}
-    headers = {"User-Agent": "Mozilla/5.0"}
+    resp = None
 
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(url, params=params, headers=headers, timeout=10)
+    # FIX: query2 fallback when query1 rate-limits
+    for host in YAHOO_HOSTS:
+        url = f"https://{host}/v8/finance/chart/{ticker}"
+        try:
+            resp = await client.get(url, params=params)
+            if resp.status_code == 200:
+                break
+            logger.warning("Host %s returned %d, trying next", host, resp.status_code)
+        except httpx.TimeoutException:
+            logger.warning("Host %s timed out, trying next", host)
+            resp = None
 
-    if resp.status_code != 200:
-        raise ValueError(f"Yahoo Finance API returned status {resp.status_code}. Please verify the ticker or try again later.")
+    if resp is None or resp.status_code != 200:
+        status = resp.status_code if resp is not None else "timeout"
+        raise ValueError(
+            f"Yahoo Finance API returned status {status}. "
+            "Please verify the ticker or try again later."
+        )
 
     data = resp.json()
     if not data.get("chart", {}).get("result"):
@@ -42,10 +122,12 @@ async def fetch_and_calculate(ticker: str, data_range: str = "10y") -> pl.DataFr
     result = data["chart"]["result"][0]
     quotes = result["indicators"]["quote"][0]
 
-    # Create DataFrame directly from JSON
+    # Build DataFrame directly from JSON
     df = pl.DataFrame({
-        "Date":   [datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
-                   for ts in result["timestamp"]],
+        "Date": [
+            datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
+            for ts in result["timestamp"]
+        ],
         "Open":   quotes.get("open",   []),
         "High":   quotes.get("high",   []),
         "Low":    quotes.get("low",    []),
@@ -93,87 +175,110 @@ async def fetch_and_calculate(ticker: str, data_range: str = "10y") -> pl.DataFr
     ])
 
     # --- Block 4: Signal, Avg Gain/Loss (Wilder's EWM), ATR, OBV ---
-    # FIX #2: Use Wilder's Smoothing (alpha=1/14) instead of rolling_mean for RSI
     df = df.with_columns([
         pl.col("MACD_Line").ewm_mean(span=9, adjust=False).alias("MACD_Signal"),
-        pl.col("gain").ewm_mean(alpha=1/14, adjust=False).alias("avg_gain"),   # ✅ Fixed
-        pl.col("loss").ewm_mean(alpha=1/14, adjust=False).alias("avg_loss"),   # ✅ Fixed
+        pl.col("gain").ewm_mean(alpha=1/14, adjust=False).alias("avg_gain"),
+        pl.col("loss").ewm_mean(alpha=1/14, adjust=False).alias("avg_loss"),
         pl.col("True_Range").ewm_mean(alpha=1/14, adjust=False).alias("ATR_14"),
-        pl.col("OBV_Step").cum_sum().alias("OBV"),
+        # FIX: ignore_nulls=True prevents null propagation from row-0 price_diff
+        pl.col("OBV_Step").cum_sum(ignore_nulls=True).alias("OBV"),
     ])
 
     # --- Block 5: MACD Hist + RSI (div-by-zero safe) ---
-    safe_avg_loss = pl.when(pl.col("avg_loss") == 0).then(1e-10).otherwise(pl.col("avg_loss"))
+    safe_avg_loss = (
+        pl.when(pl.col("avg_loss") == 0)
+          .then(1e-10)
+          .otherwise(pl.col("avg_loss"))
+    )
 
     df = df.with_columns([
         (pl.col("MACD_Line") - pl.col("MACD_Signal")).alias("MACD_Hist"),
         (100 - (100 / (1 + (pl.col("avg_gain") / safe_avg_loss)))).alias("RSI_14"),
     ])
 
-    # FIX #1: Drop nulls AFTER all indicators are calculated
     return df.select([
         "Date", "Close", "Volume",
         "SMA_20", "EMA_50", "RSI_14",
         "MACD_Line", "MACD_Signal", "MACD_Hist",
         "BB_Upper", "BB_Lower", "ATR_14", "OBV",
-    ]).drop_nulls()  # ✅ Fixed
+    ]).drop_nulls()
 
 
 # ---------------------------------------------------------
 # Endpoint: GET /api/v1/indicators/{ticker}
 # ---------------------------------------------------------
-@app.get("/api/v1/indicators/{ticker}")
+@app.get("/api/v1/indicators/{ticker}", response_model=QuantResponse)
 async def get_quant_data(
-    ticker: str,
-    target_days: int = Query(10, ge=1, le=5000, description="Number of trading days to retrieve (1-5000)"),
-    data_range: str = Query("10y", description="Raw data range to fetch for indicator warm-up (e.g., 1y, 2y, 5y, 10y, max)")
+    request:     Request,
+    ticker:      str,
+    target_days: int = Query(
+        10, ge=1, le=5000,
+        description="Number of trading days to retrieve (1–5000)",
+    ),
+    data_range:  str = Query(
+        "10y",
+        description="Raw data range for indicator warm-up (1y | 2y | 5y | 10y | max)",
+    ),
 ):
     ticker = ticker.upper()
 
-    # --- Validate ticker format ---
+    # Validate ticker format
     if not re.match(r"^[A-Z0-9.\-]{1,10}$", ticker):
         raise HTTPException(
             status_code=400,
-            detail="Invalid ticker format. Only uppercase letters, numbers, dots, and hyphens are allowed (max 10 characters)."
+            detail=(
+                "Invalid ticker format. "
+                "Only uppercase letters, numbers, dots, and hyphens are allowed (max 10 chars)."
+            ),
         )
 
-    # FIX #4: Validate data_range against whitelist
+    # Validate data_range against whitelist
     if data_range not in VALID_RANGES:
         raise HTTPException(
             status_code=400,
-            detail=f"Invalid data_range '{data_range}'. Must be one of: {sorted(VALID_RANGES)}"
+            detail=f"Invalid data_range '{data_range}'. Must be one of: {sorted(VALID_RANGES)}",
         )
 
-    # FIX #3: Use '::' separator to avoid cache key collision
-    cache_key = f"{ticker}::{data_range}"
+    cache_key         = f"{ticker}::{data_range}"
     served_from_cache = cache_key in MEMORY_CACHE
 
     if served_from_cache:
-        print(f"⚡ [CACHE HIT]  {cache_key}")
+        logger.info("CACHE HIT  %s", cache_key)
         df_clean = MEMORY_CACHE[cache_key]
     else:
-        print(f"🌐 [CACHE MISS] {cache_key} — Fetching from Yahoo...")
+        logger.info("CACHE MISS %s — fetching from Yahoo", cache_key)
         try:
-            df_clean = await fetch_and_calculate(ticker, data_range)
-            MEMORY_CACHE[cache_key] = df_clean
+            df_clean = await fetch_and_calculate(request.app.state.http, ticker, data_range)
+            # FIX: store a defensive clone so future in-place mutations don't corrupt the cache
+            MEMORY_CACHE[cache_key] = df_clean.clone()
         except ValueError as e:
             raise HTTPException(status_code=404, detail=str(e))
         except httpx.TimeoutException:
             raise HTTPException(status_code=504, detail="Yahoo Finance API request timed out.")
         except Exception as e:
+            logger.exception("Unexpected error for %s", cache_key)
             raise HTTPException(status_code=500, detail=f"Internal Server Error: {e}")
 
-    # --- Slice data to target_days ---
-    final_df = df_clean.tail(target_days)
+    rows_available = len(df_clean)
+    final_df       = df_clean.tail(target_days)
+    rows_returned  = len(final_df)
 
-    return {
-        "metadata": {
-            "ticker":            ticker,
-            "target_days":       target_days,
-            "data_range_used":   data_range,
-            "rows_returned":     len(final_df),
-            "served_from_cache": served_from_cache,
-            "timestamp":         datetime.now(tz=timezone.utc).isoformat(),
-        },
-        "data": final_df.to_dict(as_series=False),
-    }
+    if rows_returned < target_days:
+        logger.warning(
+            "%s requested %d days but only %d available",
+            ticker, target_days, rows_available,
+        )
+
+    return QuantResponse(
+        metadata=Metadata(
+            ticker=ticker,
+            target_days=target_days,
+            data_range_used=data_range,
+            rows_returned=rows_returned,
+            rows_available=rows_available,
+            truncated=rows_returned < target_days,
+            served_from_cache=served_from_cache,
+            timestamp=datetime.now(tz=timezone.utc).isoformat(),
+        ),
+        data=final_df.to_dict(as_series=False),
+    )
