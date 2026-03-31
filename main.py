@@ -181,7 +181,7 @@ async def fetch_and_calculate(
         pl.col("loss").ewm_mean(alpha=1/14, adjust=False).alias("avg_loss"),
         pl.col("True_Range").ewm_mean(alpha=1/14, adjust=False).alias("ATR_14"),
         # FIX: ignore_nulls=True prevents null propagation from row-0 price_diff
-        pl.col("OBV_Step").cum_sum(ignore_nulls=True).alias("OBV"),
+        pl.col("OBV_Step").fill_null(0).cum_sum().alias("OBV"),
     ])
 
     # --- Block 5: MACD Hist + RSI (div-by-zero safe) ---
